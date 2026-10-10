@@ -1319,7 +1319,12 @@ ${doc.querySelector('parsererror').innerText}`)
             }
             return {
                 id: item.href,
-                load: () => this.#loader.loadItem(item),
+                load: async () => {
+                    const t0 = performance.now()
+                    const r = await this.#loader.loadItem(item)
+                    console.log(`[epub-perf][section.load(${index})][${(performance.now() - t0).toFixed(0)}ms][size=${this.getSize(item.href)}]`)
+                    return r
+                },
                 unload: () => this.#loader.unloadItem(item),
                 loadText: () => this.#loader.loadText(item.href),
                 loadContent: () => this.#loader.loadItemXHTMLContent(item),
