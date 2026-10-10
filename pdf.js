@@ -4,6 +4,17 @@ const pdfjsPath = path => `/vendor/pdfjs/${path}`
 // decoder then fails to load and every scanned page renders blank.
 const pdfjsURL = path => new URL(pdfjsPath(path), location.href).href
 
+// Promise.withResolvers is missing on older WebViews; pdf.js needs it in both
+// the main thread and its worker.
+const WITH_RESOLVERS_POLYFILL = `Promise.withResolvers ??= function () {
+    let resolve, reject
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+    return { promise, resolve, reject }
+}
+`
+const needsWorkerShim = typeof Promise.withResolvers !== 'function'
+eval(WITH_RESOLVERS_POLYFILL)
+
 let pdfjsLib
 let pdfjsLibPromise
 const loadPDFJS = async () => {
@@ -12,7 +23,14 @@ const loadPDFJS = async () => {
             pdfjsLib = globalThis.pdfjsLib
             const workerSrc = pdfjsLib.GlobalWorkerOptions.workerSrc
             if (!workerSrc || workerSrc === './pdf.worker.mjs') {
-                pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.min.mjs')
+                const workerUrl = new URL(pdfjsPath('pdf.worker.min.mjs'), location.href).href
+                if (!needsWorkerShim) {
+                    pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
+                } else {
+                    const blob = new Blob([`${WITH_RESOLVERS_POLYFILL}await import(${JSON.stringify(workerUrl)})`],
+                        { type: 'text/javascript' })
+                    pdfjsLib.GlobalWorkerOptions.workerPort = new Worker(URL.createObjectURL(blob), { type: 'module' })
+                }
             }
             return pdfjsLib
         })
@@ -858,8 +876,20 @@ const MAX_CACHED_PAGES = 16
 // WebView's heap, crashing on 50 MB+ PDFs (readest #3470). Throttle here.
 const MAX_CONCURRENT_RANGES = 6
 
+// Debug switch: logs one `[pdf-perf]` line per stage; set false to silence.
+const DEBUG_PDF_TIMING = true
+const perfMark = (label) => {
+    const t0 = performance.now()
+    return (extra = '') => {
+        if (DEBUG_PDF_TIMING) console.log(`[pdf-perf][${label}][${(performance.now() - t0).toFixed(0)}ms]${extra}`)
+    }
+}
+
 export const makePDF = async file => {
+    const endTotal = perfMark(`makePDF size=${(file.size / 1048576).toFixed(1)}MB`)
+    let end = perfMark('loadPDFJS')
     await loadPDFJS()
+    end()
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     // Bound the concurrent range reads instead of dispatching them all at once.
     let active = 0
@@ -868,8 +898,9 @@ export const makePDF = async file => {
         while (active < MAX_CONCURRENT_RANGES && queue.length) {
             const [begin, end] = queue.shift()
             active++
+            const endRange = perfMark('range')
             file.slice(begin, end).arrayBuffer()
-                .then(chunk => transport.onDataRange(begin, chunk))
+                .then(chunk => { endRange(`[${begin}+${end - begin}]`); transport.onDataRange(begin, chunk) })
                 .finally(() => { active--; pump() })
         }
     }
@@ -879,9 +910,11 @@ export const makePDF = async file => {
     }
     const loadingTask = pdfjsLib.getDocument({
         range: transport,
-        wasmUrl: pdfjsURL(''),
-        cMapUrl: pdfjsURL('cmaps/'),
-        standardFontDataUrl: pdfjsURL('standard_fonts/'),
+        rangeChunkSize: 1048576,
+        disableAutoFetch: true,
+        wasmUrl: pdfjsPath(''),
+        cMapUrl: pdfjsPath('cmaps/'),
+        standardFontDataUrl: pdfjsPath('standard_fonts/'),
         isEvalSupported: false,
         // Readest's worker hook shrinks those images as it decodes them. It runs
         // in a blob: worker, which on iOS can't fetch tauri:// URLs, so the page
@@ -890,17 +923,23 @@ export const makePDF = async file => {
             ? { canvasMaxAreaInBytes: MAX_IMAGE_BYTES, useWorkerFetch: false }
             : {}),
     })
+    end = perfMark('getDocument')
     const pdf = await loadingTask.promise
+    end(`[pages=${pdf.numPages}]`)
 
     // Get viewport dimensions from first page for fixed-layout rendering
+    end = perfMark('getPage1')
     const firstPage = await pdf.getPage(1)
+    end()
     const firstViewport = firstPage.getViewport({ scale: 1 })
     const book = { rendition: {
         layout: 'pre-paginated',
         viewport: { width: firstViewport.width, height: firstViewport.height },
     } }
 
+    end = perfMark('getMetadata')
     const { metadata, info } = await pdf.getMetadata() ?? {}
+    end()
     book.metadata = parsePDFMetadata({ info, xmp: metadata?.getRaw?.() })
 
     // PDFs bound right-to-left (Japanese photo books, manga) declare it in the
@@ -911,8 +950,10 @@ export const makePDF = async file => {
         ?? viewerPreferences?.Direction
     if (direction === 'R2L') book.dir = 'rtl'
 
+    end = perfMark('outline+toc')
     const outline = await pdf.getOutline()
     book.toc = outline ? await Promise.all(outline.map(item => makeTOCItem(item, pdf))) : null
+    end(`[items=${outline?.length ?? 0}]`)
 
     // Page labels (PDF 32000-1 §12.4.2) are the numbers printed on the pages
     // -- roman-numeral front matter, a body that restarts at 1 -- and are what
@@ -920,7 +961,9 @@ export const makePDF = async file => {
     // into the file. Expose them as the page list so they reach readers through
     // the same `pageItem` channel as an EPUB page-list nav. Like PDF.js, ignore
     // labels that merely restate the physical page numbers or are all empty.
+    end = perfMark('pageLabels')
     const labels = await pdf.getPageLabels().catch(() => null)
+    end()
     book.pageList = labels?.some((label, i) => label && label !== String(i + 1))
         ? labels.map((label, i) => ({ label, href: JSON.stringify(i), index: i }))
         : null
@@ -935,7 +978,9 @@ export const makePDF = async file => {
             pageCache.set(i, cached)
             return cached
         }
+        const endPage = perfMark(`getPage(${i + 1})`)
         const page = await pdf.getPage(i + 1)
+        endPage()
         pageCache.set(i, page)
 
         // Evict oldest pages when over limit, freeing internal page data
@@ -958,7 +1003,9 @@ export const makePDF = async file => {
                 cache.set(i, cached)
                 return cached
             }
+            const endLoad = perfMark(`section.load(${i + 1})`)
             const url = await renderPage(await getPage(i))
+            endLoad()
             cache.set(i, url)
 
             // Evict oldest render results when over limit
@@ -972,6 +1019,7 @@ export const makePDF = async file => {
             return url
         },
         createDocument: async () => {
+            const endDoc = perfMark(`createDocument(${i + 1})`)
             const page = await getPage(i)
             const doc = document.implementation.createHTMLDocument('')
 
@@ -1006,6 +1054,7 @@ export const makePDF = async file => {
                     }
                 }
             }
+            endDoc()
             return doc
         },
         size: 1000,
@@ -1074,5 +1123,6 @@ export const makePDF = async file => {
         pageCache.clear()
         loadingTask.destroy()
     }
+    endTotal()
     return book
 }
