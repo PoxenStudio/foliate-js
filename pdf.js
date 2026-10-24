@@ -235,6 +235,16 @@ const renderGenerations = new WeakMap()
 // What each document was last rendered for, so an identical re-render can be
 // skipped instead of rebuilding the text layer (see `render`)
 const renderedFor = new WeakMap()
+// Pages with an in-flight `render()`, counted since one page can render twice
+// at once. Eviction must not `cleanup()` these or their canvas is cancelled.
+const renderingPages = new WeakMap()
+const startRendering = page => renderingPages.set(page, (renderingPages.get(page) || 0) + 1)
+const finishRendering = page => {
+    const count = renderingPages.get(page) || 0
+    if (count > 1) renderingPages.set(page, count - 1)
+    else renderingPages.delete(page)
+}
+const isRendering = page => renderingPages.has(page)
 
 // Set up panning and selection event handlers once per iframe document
 export const setupPanningEvents = (doc) => {
@@ -671,20 +681,27 @@ const render = async (page, doc, zoom, pageColors) => {
     canvas.style.width = `${displayViewport.width}px`
     canvas.style.height = `${displayViewport.height}px`
     const canvasContext = canvas.getContext('2d')
+    const endRender = perfMark(`render(${page.pageNumber})`)
     const renderTask = page.render({ canvasContext, viewport: renderViewport })
     activeRenderTasks.set(doc, renderTask)
+    startRendering(page)
     const colorMatrix = pageColors && getPageColorMatrix(pageColors)
     const operatorList = getRenderOperatorList(page, renderTask)
 
     try {
         await renderTask.promise
-    } catch {
-        // Render was cancelled or failed — release canvas bitmap memory
+    } catch (e) {
+        // A cancel is expected when superseded; anything else leaves the page
+        // blank, so surface it instead of swallowing it.
         canvas.width = 0
         canvas.height = 0
         forget()
+        const cancelled = e?.name === 'RenderingCancelledException'
+        if (!cancelled) console.warn(`[pdf-perf] render(${page.pageNumber}) failed`, e)
+        endRender(cancelled ? '[cancelled]' : '[failed]')
         return
     } finally {
+        finishRendering(page)
         if (activeRenderTasks.get(doc) === renderTask) {
             activeRenderTasks.delete(doc)
         }
@@ -698,6 +715,7 @@ const render = async (page, doc, zoom, pageColors) => {
         canvas.width = 0
         canvas.height = 0
         forget()
+        endRender('[superseded]')
         return
     }
 
@@ -706,6 +724,7 @@ const render = async (page, doc, zoom, pageColors) => {
         canvas.width = 0
         canvas.height = 0
         forget()
+        endRender('[no-canvas]')
         return
     }
 
@@ -739,6 +758,7 @@ const render = async (page, doc, zoom, pageColors) => {
     // Bail out if superseded after async text layer render
     if (renderGenerations.get(doc) !== generation) {
         forget()
+        endRender()
         return
     }
 
@@ -786,6 +806,7 @@ const render = async (page, doc, zoom, pageColors) => {
     await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
         annotations: await page.getAnnotations(),
     })
+    endRender()
 }
 
 const renderPage = async (page, getImageBlob) => {
@@ -988,7 +1009,8 @@ export const makePDF = async file => {
             const oldestKey = pageCache.keys().next().value
             const oldPage = pageCache.get(oldestKey)
             pageCache.delete(oldestKey)
-            oldPage?.cleanup()
+            // cleanup() would cancel an in-flight render and blank the canvas.
+            if (!(oldPage && isRendering(oldPage))) oldPage?.cleanup()
         }
 
         return page
@@ -1102,8 +1124,8 @@ export const makePDF = async file => {
             canvas.height = 0
             throw e
         } finally {
-            // pdf.js shares page objects, so leave pages the reader holds alone
-            if (!pageCache.has(index)) page.cleanup()
+            // Leave pages the reader holds, or is rendering, alone.
+            if (!pageCache.has(index) && !isRendering(page)) page.cleanup()
         }
         return new Promise(resolve => canvas.toBlob(blob => {
             canvas.width = 0

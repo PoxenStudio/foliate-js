@@ -154,6 +154,19 @@ export const planScrollModePages = ({
     return { load, evict }
 }
 
+// Canvas-rendered pages (pdf.js) get a symmetric prerender window; the generic
+// formula leads only forward and never backward, so a fling outruns it.
+const PDF_PRELOAD_FORWARD = 2
+const PDF_PRELOAD_BACKWARD = 2
+const PDF_MAX_CONCURRENT_PRELOADS = 2
+const PDF_MAX_CACHED_SPREADS = 6
+
+export const preloadSpreadWindow = ({ canvasRendered, numPrerenderedSpreads }) => {
+    if (canvasRendered) return { forward: PDF_PRELOAD_FORWARD, backward: PDF_PRELOAD_BACKWARD }
+    const forward = Math.max(1, numPrerenderedSpreads - 1)
+    return { forward, backward: Math.max(0, numPrerenderedSpreads - forward) }
+}
+
 // Live CSS transform for a scroll-mode pinch gesture. Scroll mode has no single
 // spread frame to scale, so the whole scroll container is scaled for immediate
 // visual feedback while the fingers move (instead of only re-rendering on
@@ -324,6 +337,9 @@ export class FixedLayout extends HTMLElement {
     #maxConcurrentPreloads = 1
     #numPrerenderedSpreads = 1
     #maxCachedSpreads = 2
+    // Set once a frame carries `onZoom` (pdf.js): canvas pages need the wider
+    // prerender window and the stale-turn guard below.
+    #zoomRendering = false
     #overlayers = new Map()
     #pageColors = {}
     #preloadQueue = []
@@ -659,6 +675,7 @@ export class FixedLayout extends HTMLElement {
         const src = srcOptionIsString ? srcOption : srcOption?.src
         const data = srcOptionIsString ? null : srcOption?.data
         const onZoom = srcOptionIsString ? null : srcOption?.onZoom
+        if (onZoom) this.#zoomRendering = true
         const element = document.createElement('div')
         element.setAttribute('dir', 'ltr')
         element.style.position = 'relative'
@@ -1212,6 +1229,7 @@ export class FixedLayout extends HTMLElement {
         const src = srcOptionIsString ? srcOption : srcOption?.src
         const data = srcOptionIsString ? null : srcOption?.data
         const onZoom = srcOptionIsString ? null : srcOption?.onZoom
+        if (onZoom) this.#zoomRendering = true
 
         const element = document.createElement('div')
         element.setAttribute('dir', 'ltr')
@@ -1715,6 +1733,9 @@ export class FixedLayout extends HTMLElement {
                 const src = await spread.center?.load?.()
                 this.#regroup()
                 if (this.#spreads[index] !== spread) return this.#goToPageOf(spread, side, reason)
+                // Only the newest turn may show its spread; a stale one would
+                // hide the page the newer turn is painting.
+                if (this.#zoomRendering && this.#index !== index) return
                 await this.#showSpread({ center: { index: sectionIndex, src }, spreadIndex: index, side })
             } else {
                 const indexL = this.book.sections.indexOf(spread.left)
@@ -1723,6 +1744,7 @@ export class FixedLayout extends HTMLElement {
                 const srcR = await spread.right?.load?.()
                 this.#regroup()
                 if (this.#spreads[index] !== spread) return this.#goToPageOf(spread, side, reason)
+                if (this.#zoomRendering && this.#index !== index) return
                 const left = { index: indexL, src: srcL }
                 const right = { index: indexR, src: srcR }
                 await this.#showSpread({ left, right, side, spreadIndex: index })
@@ -1738,8 +1760,10 @@ export class FixedLayout extends HTMLElement {
         if (this.#numPrerenderedSpreads <= 0) return
 
         const toPreload = []
-        const forwardPreloadCount = Math.max(1, this.#numPrerenderedSpreads - 1)
-        const backwardPreloadCount = Math.max(0, this.#numPrerenderedSpreads - forwardPreloadCount)
+        const { forward: forwardPreloadCount, backward: backwardPreloadCount } = preloadSpreadWindow({
+            canvasRendered: this.#zoomRendering,
+            numPrerenderedSpreads: this.#numPrerenderedSpreads,
+        })
         for (let distance = 1; distance <= forwardPreloadCount; distance++) {
             const forwardIndex = this.#index + distance
             if (forwardIndex >= 0 && forwardIndex < this.#spreads.length) {
@@ -1755,6 +1779,10 @@ export class FixedLayout extends HTMLElement {
         for (const { index: targetIndex, direction } of toPreload) {
             const cacheKey = `spread-${targetIndex}`
             if (this.#prerenderedSpreads.has(cacheKey)) continue
+            // Skip spreads already queued or loading, or the wider window
+            // double-renders them.
+            if (this.#preloadCache.get(cacheKey) === 'loading') continue
+            if (this.#preloadQueue.some(task => task.cacheKey === cacheKey)) continue
             const spread = this.#spreads[targetIndex]
             if (!spread) continue
             this.#preloadQueue.push({ targetIndex, direction, spread, cacheKey })
@@ -1764,7 +1792,9 @@ export class FixedLayout extends HTMLElement {
     }
 
     async #processPreloadQueue() {
-        while (this.#preloadQueue.length > 0 && this.#activePreloads < this.#maxConcurrentPreloads) {
+        const maxConcurrent = this.#zoomRendering
+            ? PDF_MAX_CONCURRENT_PRELOADS : this.#maxConcurrentPreloads
+        while (this.#preloadQueue.length > 0 && this.#activePreloads < maxConcurrent) {
             const task = this.#preloadQueue.shift()
             if (!task) break
 
@@ -1838,7 +1868,7 @@ export class FixedLayout extends HTMLElement {
         this.#spreadAccessTime.set(cacheKey, ++this.#spreadAccessTick)
     }
     #cleanupPreloadCache() {
-        const maxSpreads = this.#maxCachedSpreads
+        const maxSpreads = this.#zoomRendering ? PDF_MAX_CACHED_SPREADS : this.#maxCachedSpreads
         if (this.#prerenderedSpreads.size <= maxSpreads) {
             return
         }
